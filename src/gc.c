@@ -139,7 +139,7 @@ size_t gc_build_table(void)
        keeps the table out of .data/.bss, which M2 scans for roots — a
        table of block addresses sitting in the root set would mark every
        block in the heap as reachable.  */
-    gc_table = malloc(n * sizeof *gc_table);
+    gc_table = malloc(n * sizeof *gc_table); // malloc gives payload aligned to max align always so no need to worry
     if (gc_table == NULL)
         return 0;
 
