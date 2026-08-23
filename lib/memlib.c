@@ -13,7 +13,7 @@
 #include <errno.h>
 
 #include "memlib.h"
-#define MAX_HEAP (512 * (1 << 20)) // 5120 pages 20MiB
+#define MAX_HEAP (512 * (1 << 20))
 
 /* $begin memlib */
 /* Private global variables */

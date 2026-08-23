@@ -117,7 +117,7 @@
 /* GET_SIZE — extract the block size (in bytes) from the header or footer
    word at P.  The low three bits are masked off because they carry flags;
    only bit 0 (the allocation bit) is currently used.  */
-#define GET_SIZE(p) (GET(p) & ~0x7)
+#define GET_SIZE(p) (GET(p) & ~0x7) // min block size is 16 which means last 3 bits are 0 even 8 ensures it
 
 /* GET_ALLOC — extract the allocation flag from the header or footer word
    at P.  Returns 1 if the block is allocated, 0 if it is free.  */
