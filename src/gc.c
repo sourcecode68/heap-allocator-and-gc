@@ -147,15 +147,19 @@ size_t gc_build_table(void)
        this visits blocks in strictly increasing address order and the
        table comes out sorted with no sort step.  */
     for (bp = NEXT_BLKP(gc_prologue()); GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
-        if (GET_ALLOC(HDRP(bp)))
+        if (GET_ALLOC(HDRP(bp)) && i < n)
         {
             gc_table[i].payload = bp;
             gc_table[i].psize = GET_SIZE(HDRP(bp)) - DSIZE;
             i++;
         }
 
-    gc_table_len = n;
-    return n;
+    /* Record what was actually written, not what pass 1 predicted.  The
+       i < n guard above stops the loop overrunning the table; using i
+       here closes the mirror case, where pass 2 finds FEWER blocks than
+       pass 1 and the tail would otherwise be claimed but uninitialised. */
+    gc_table_len = i;
+    return i;
 }
 
 void gc_table_dump(void)
@@ -172,6 +176,80 @@ void gc_table_dump(void)
         printf("  [%2zu] payload %p  psize %4zu  accepts %p .. %p\n",
                i, (void *)p, s, (void *)p, (void *)(p + s - 1));
     }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  The pointer test
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* gc_isPtr (candidate)
+ *
+ * Decide whether CANDIDATE — an arbitrary word read out of a root region
+ * or out of some block's payload — points anywhere inside the payload of
+ * an allocated block, and if so return that block's payload start.
+ *
+ * Two stages, cheapest first.
+ *
+ * Stage 1 is a heap bounds check.  Almost every word the collector will
+ * ever examine is not a heap address at all, so this rejection carries
+ * the common case and the search below never runs on it.  gc_heap_hi is
+ * the last valid byte rather than one past the end, hence <=.
+ *
+ * Stage 2 searches for the first table entry whose payload begins
+ * strictly ABOVE the candidate, then steps back one.  Since the table is
+ * in increasing address order, that predecessor is the only block that
+ * could possibly contain the candidate.  Nothing is being matched
+ * exactly here: an interior pointer appears in no entry, which is why
+ * the search looks for a bound rather than for equality.
+ *
+ * The closing range check is doing double duty.  Besides settling
+ * interior pointers, it is what rejects free blocks: a candidate inside
+ * a free block searches back to whatever allocated block precedes it and
+ * then falls outside that block's payload.  Free blocks are excluded by
+ * construction rather than by a special case — which matters, because a
+ * free block's first two payload words hold the explicit free list's
+ * PRED and SUCC, and those are real heap addresses that a conservative
+ * collector would otherwise follow.
+ *
+ * Headers and footers lie outside every block, because entries record
+ * the payload size and the accepted range stops short of the footer.
+ */
+void *gc_isPtr(void *candidate)
+{
+    char *cand = (char *)candidate;
+    struct gc_block *e;
+    size_t lo, hi;
+
+    if (gc_table_len == 0)
+        return NULL;
+
+    /* Stage 1 — is it even inside the heap? */
+    if (cand < (char *)gc_heap_lo() || cand > (char *)gc_heap_hi())
+        return NULL;
+
+    /* Stage 2 — first entry starting strictly above cand.
+       lo + (hi - lo) / 2 rather than (lo + hi) / 2: the overflow it
+       avoids is unreachable in a 4 GB address space, but the habit is
+       worth more than the two characters it costs. */
+    lo = 0;
+    hi = gc_table_len;
+    while (lo < hi)
+    {
+        size_t mid = lo + (hi - lo) / 2;
+        if (gc_table[mid].payload <= cand)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+
+    if (lo == 0)
+        return NULL; /* cand sits below every recorded block */
+
+    e = &gc_table[lo - 1];
+    if (cand < e->payload + e->psize)
+        return e->payload;
+
+    return NULL;
 }
 
 /* ══════════════════════════════════════════════════════════════════
