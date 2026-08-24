@@ -12,6 +12,16 @@
 #include "gc.h"
 
 #define NBLOCKS 10
+#define CHAIN_LEN 5
+#define GARBAGE_LEN 3
+#define NODE_BYTES 16 /* a multiple of 8, so the payload has no padding */
+
+/* g_chain - the ONE global root the M2 test introduces.
+ *
+ * It lands in .bss, which is exactly what gc_collect scans.  Every other
+ * pointer the test holds lives in a local, and locals are on the stack,
+ * which M2 does not scan.  That asymmetry is the whole experiment. */
+static void *g_chain;
 
 static void section(const char *name)
 {
@@ -161,8 +171,119 @@ int main(void)
     printf("checkheap(0) reported nothing\n");
 
     gc_free_table();
-    gc_collect(); /* still a stub */
 
-    printf("\n=== M1 COMPLETE — ALL POINTER TESTS PASSED ===\n");
+    section("M2 smoke test: collect with only .data/.bss as roots");
+    printf("7 blocks are allocated, and every pointer to them lives in\n");
+    printf("blocks[], which is a local in main.\n\n");
+    gc_collect();
+    gc_report();
+
+    section("allocator invariants after a collection");
+    checkheap(0);
+    printf("checkheap(0) reported nothing — marks were cleared\n");
+
+    /* ═══════════════════════════════════════════════════════════════
+     *  M2 — a global pointer to a chain of 5, and 3 blocks with no
+     *  reference from any root region.
+     * ═══════════════════════════════════════════════════════════════ */
+
+    section("M2: reset the heap");
+    /* Free every M1 block that is still allocated — 2, 5 and 8 already
+       went in M1d, and freeing them again would be a double free.  The
+       counts below only mean what they say on an otherwise empty heap. */
+    for (i = 0; i < NBLOCKS; i++)
+        if (i != 2 && i != 5 && i != 8)
+            mm_free(blocks[i]);
+    assert(gc_build_table() == 0);
+    gc_free_table();
+    printf("heap holds no allocated blocks\n");
+
+    section("M2: build a 5-block chain plus 3 unreferenced blocks");
+    {
+        void *garbage[GARBAGE_LEN];
+        void *prev = NULL;
+
+        /* mm_calloc, not mm_malloc.  The collector is perfectly happy
+           with garbage — a stale word that looks like a pointer just
+           retains a block, which is imprecise but never wrong.  It is
+           the TEST that cannot tolerate it: asserting an exact count of
+           5 means controlling every word the marker will scan.  The
+           allocator writes PRED/SUCC into freed payloads, and these
+           blocks are carved from memory that was just freed. */
+        for (i = 0; i < CHAIN_LEN; i++)
+        {
+            void *node = mm_calloc(1, NODE_BYTES);
+            assert(node != NULL);
+            *(void **)node = prev; /* link to the previous node */
+            prev = node;
+        }
+        g_chain = prev; /* only the head is reachable from a root */
+
+        for (i = 0; i < GARBAGE_LEN; i++)
+        {
+            garbage[i] = mm_calloc(1, NODE_BYTES);
+            assert(garbage[i] != NULL);
+        }
+
+        printf("chain head (global g_chain) : %p\n", g_chain);
+        printf("garbage blocks (locals only): %p %p %p\n",
+               garbage[0], garbage[1], garbage[2]);
+    }
+
+    section("M2: collect");
+    {
+        size_t mblocks, mbytes, tblocks, tbytes;
+
+        gc_collect();
+        gc_report();
+        gc_stats(&mblocks, &mbytes, &tblocks, &tbytes);
+
+        printf("\n");
+        assert(tblocks == CHAIN_LEN + GARBAGE_LEN);
+        assert(mblocks == CHAIN_LEN);
+        assert(mbytes == CHAIN_LEN * NODE_BYTES);
+        assert(tblocks - mblocks == GARBAGE_LEN);
+        printf("  %zu allocated, %zu reachable, %zu unreachable — as expected\n",
+               tblocks, mblocks, tblocks - mblocks);
+    }
+
+    section("M2: marking did not corrupt the chain");
+    {
+        void *p = g_chain;
+        int links = 0;
+        while (p != NULL)
+        {
+            links++;
+            p = *(void **)p;
+        }
+        printf("walked %d links from g_chain\n", links);
+        assert(links == CHAIN_LEN);
+    }
+
+    section("M2: a cycle must terminate, not hang");
+    {
+        size_t mblocks;
+        void *tail = g_chain;
+
+        /* Walk to the end and point it back at the head.  Without
+           mark-before-push in gc_push this does not fail an assertion —
+           it loops forever. */
+        while (*(void **)tail != NULL)
+            tail = *(void **)tail;
+        *(void **)tail = g_chain;
+
+        gc_collect();
+        gc_stats(&mblocks, NULL, NULL, NULL);
+        printf("collected a cyclic chain, %zu blocks reachable\n", mblocks);
+        assert(mblocks == CHAIN_LEN);
+
+        *(void **)tail = NULL; /* undo, so checkheap sees a plain chain */
+    }
+
+    section("allocator invariants after marking 5 blocks");
+    checkheap(0);
+    printf("checkheap(0) reported nothing — the clear pass really ran\n");
+
+    printf("\n=== M2 COMPLETE — MARKING FROM GLOBALS WORKS ===\n");
     return 0;
 }

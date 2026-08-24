@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h> /* uintptr_t, for aligning scan candidates */
 #include "memlib.h"
 #include "gc.h"
 
@@ -18,8 +19,8 @@
  *  cannot be exported.  What follows is gc.c's own copy of the same
  *  layout.  This is duplication, and it is deliberate.
  *
- *  Every use below only ever READS the heap.  The collector writes
- *  nothing until M2 claims the mark bit.
+ *  Reads use GET; the single write the collector makes is the mark bit,
+ *  via PUT below.
  * ══════════════════════════════════════════════════════════════════ */
 
 #define WSIZE 4 /* header / footer size (bytes)        */
@@ -31,6 +32,27 @@
 
 #define HDRP(bp) ((char *)(bp) - WSIZE)
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
+
+/* ── The mark bit ──────────────────────────────────────────────────
+ *
+ * PUT is the collector's only write into the heap.  Everything else
+ * here reads.
+ *
+ * Bit 1 of the header is the mark bit.  It is free because every block
+ * size is a multiple of 8, which forces the low three bits of the size
+ * field to zero, and bit 0 is already spoken for as the allocated flag.
+ *
+ * Setting it is invisible to the allocator: GET_SIZE masks off ~0x7 and
+ * GET_ALLOC masks off 0x1, so neither ever sees bit 1.  It is NOT
+ * invisible to checkblock, which compares the raw header and footer
+ * words — which is why gc_collect clears every mark before returning.
+ * The two copies disagree only inside a collection, and nothing can
+ * look at the heap during one.
+ */
+#define PUT(p, val) (*(unsigned int *)(p) = (val))
+#define GET_MARK(p) ((GET(p) & 0x2) != 0)
+#define SET_MARK(p) PUT(p, GET(p) | 0x2)
+#define CLR_MARK(p) PUT(p, GET(p) & ~0x2)
 
 /* ══════════════════════════════════════════════════════════════════
  *  Heap bounds
@@ -214,9 +236,11 @@ void gc_table_dump(void)
  * Headers and footers lie outside every block, because entries record
  * the payload size and the accepted range stops short of the footer.
  */
-void *gc_isPtr(void *candidate)
+/* gc_lookup carries the work; gc_isPtr is the public face of it.  The
+   split exists because marking needs the block's payload SIZE to know
+   how far to scan, and gc_isPtr's signature only hands back the start. */
+static struct gc_block *gc_lookup(char *cand)
 {
-    char *cand = (char *)candidate;
     struct gc_block *e;
     size_t lo, hi;
 
@@ -247,16 +271,240 @@ void *gc_isPtr(void *candidate)
 
     e = &gc_table[lo - 1];
     if (cand < e->payload + e->psize)
-        return e->payload;
+        return e;
 
     return NULL;
 }
+void *gc_isPtr(void *candidate)
+{
+    struct gc_block *e = gc_lookup((char *)candidate);
+    return e ? e->payload : NULL;
+}
+/*══════════════════════════════════════════════════════════════════
+ * Marking
+ *
+ *  Reachability is computed with an explicit worklist, never recursion.
+ *  A chain of N blocks would otherwise cost N stack frames, and nothing
+ *  bounds N but the size of the heap.
+ * ══════════════════════════════════════════════════════════════════ */
 
+/* Blocks that are marked but whose payloads have not been scanned yet.
+   The list holds table entries rather than bare addresses so that each
+   block's payload size travels with it.
+
+   Storage comes from libc malloc, for the same two reasons as the table:
+   allocating out of the heap under collection would disturb the snapshot
+   just taken, and an array of block addresses sitting in .bss would be
+   scanned as a root region and mark the entire heap reachable.
+
+   It cannot overflow.  gc_push pushes only a block whose mark bit was
+   clear, and sets the bit before pushing, so a block enters at most once
+   and the list never exceeds gc_table_len entries. */
+static struct gc_block **gc_worklist;
+static size_t gc_work_top;
+
+/* gc_push - mark a block and queue its payload for scanning.
+ *
+ * Setting the bit BEFORE the push is what bounds the worklist, and it is
+ * equally what terminates a cyclic structure: if block A holds a pointer
+ * to B and B holds one back to A, the second visit finds the bit already
+ * set and goes no further. */
+static void gc_push(struct gc_block *e)
+{
+    char *hdr = HDRP(e->payload);
+
+    if (GET_MARK(hdr))
+        return;
+
+    SET_MARK(hdr);
+
+    gc_worklist[gc_work_top++] = e;
+}
+
+/* gc_mark_range (lo, hi)
+ *
+ * Treat every aligned word in [LO, HI) as a candidate pointer and mark
+ * whatever it resolves to.  Used for both root regions and block
+ * payloads: the collector cannot tell those apart, and does not need to.
+ *
+ * Candidates step 4 bytes at a time and are aligned to 4, because a
+ * pointer is 4 bytes on i386 and the compiler will not place one at an
+ * unaligned address.  Note that 4 is the POINTER alignment, not the
+ * 8-byte alignment of block payloads; conflating the two is how half the
+ * roots get missed. */
+static void gc_mark_range(char *lo, char *hi)
+{
+    char *p = (char *)(((uintptr_t)lo + 3u) & ~(uintptr_t)3u); /* align up */
+    // p is always an address never a value we get value by dereferencing
+    for (; p + WSIZE <= hi; p += WSIZE)
+    {
+        // so now i have to read 4B value starting from the address p and treat is as an adddress to a character
+        struct gc_block *e = gc_lookup((char *)GET(p));
+        // struct gc_block*e=gc_lookup(*(char**)p); treat p as holding a pointer to a char * so dereffing gives me the 4 byte pointer to char * note that p still holds an address
+
+        if (e != NULL)
+        {
+            gc_push(e);
+        }
+    }
+}
+/* gc_drain - scan queued payloads until nothing is left to scan.
+ *
+ * Each payload scanned may queue more blocks, so this runs until the
+ * worklist empties rather than for any fixed number of rounds. */
+static void gc_drain(void)
+{
+    while (gc_work_top > 0)
+    {
+        struct gc_block *e = gc_worklist[--gc_work_top];
+        gc_mark_range(e->payload, e->payload + e->psize);
+    }
+}
+
+/* gc_clear_marks - return every header to its unmarked state.
+ *
+ * The table is exactly the set of blocks that could have been marked, so
+ * walking it is both complete and cheaper than walking the heap.  M3's
+ * sweep absorbs this pass, since it must already visit every block. */
+static void gc_clear_marks(void)
+{
+    size_t i;
+    for (i = 0; i < gc_table_len; i++)
+        CLR_MARK(HDRP(gc_table[i].payload));
+}
 /* ══════════════════════════════════════════════════════════════════
  *  Collection
  * ══════════════════════════════════════════════════════════════════ */
+/* The root set, M2 edition: the executable's own .data and .bss.
+ *
+ * These four symbols are placed by the GNU linker; no object file
+ * defines them.  They are declared as ARRAYS deliberately — a linker
+ * boundary symbol has no storage of its own, so what you want is the
+ * address the name sits at, and an array name decays to exactly that.
+ * Declaring them `extern char *__data_start` instead would read the four
+ * bytes stored AT that address and scan a garbage range, silently.
+ *
+ * Scanned as two ranges rather than one merged span: .data and .bss are
+ * adjacent in this binary, but that is not guaranteed.
+ *
+ * The stack and the registers are not roots yet.  M4 and M5.
+ */
+extern char __data_start[], _edata[]; /* .data */
+extern char __bss_start[], _end[];    /* .bss  */
 
+/* Statistics from the most recent collection.
+ *
+ * gc_report cannot count mark bits for itself, because gc_collect clears
+ * every mark before returning.  So the counting happens inside the
+ * collection — after draining, before clearing — and the numbers are
+ * parked here for gc_report to print afterwards.
+ *
+ * These live in .bss, which the NEXT collection scans as a root region.
+ * They are small counts, far below the heap's address range, so
+ * gc_lookup's bounds check rejects them.  Worth being aware of rather
+ * than lucky about: anything parked in .bss becomes a root candidate. */
+static size_t gc_marked_blocks;
+static size_t gc_marked_bytes;
+static size_t gc_total_blocks;
+static size_t gc_total_bytes;
+
+/* gc_record_stats - tally marked against allocated while the bits are
+   still set.  Payload bytes rather than block bytes: the boundary tags
+   are overhead the program never sees. */
+static void gc_record_stats(void)
+{
+    size_t i;
+
+    gc_marked_blocks = 0;
+    gc_marked_bytes = 0;
+    gc_total_blocks = gc_table_len;
+    gc_total_bytes = 0;
+
+    for (i = 0; i < gc_table_len; i++)
+    {
+        gc_total_bytes += gc_table[i].psize;
+        if (GET_MARK(HDRP(gc_table[i].payload)))
+        {
+            gc_marked_blocks++;
+            gc_marked_bytes += gc_table[i].psize;
+        }
+    }
+}
+
+void gc_stats(size_t *marked_blocks, size_t *marked_bytes,
+              size_t *total_blocks, size_t *total_bytes)
+{
+    if (marked_blocks)
+        *marked_blocks = gc_marked_blocks;
+    if (marked_bytes)
+        *marked_bytes = gc_marked_bytes;
+    if (total_blocks)
+        *total_blocks = gc_total_blocks;
+    if (total_bytes)
+        *total_bytes = gc_total_bytes;
+}
+
+void gc_report(void)
+{
+    printf("gc: reachable   %zu/%zu blocks, %zu/%zu payload bytes\n",
+           gc_marked_blocks, gc_total_blocks,
+           gc_marked_bytes, gc_total_bytes);
+    printf("gc: unreachable %zu blocks, %zu payload bytes (nothing freed yet)\n",
+           gc_total_blocks - gc_marked_blocks,
+           gc_total_bytes - gc_marked_bytes);
+}
+
+/* gc_collect - one full marking pass.
+ *
+ * The phase order is forced, not chosen:
+ *
+ *   1. Snapshot the heap.  Everything downstream reads this table, and
+ *      it stays valid only because nothing else can run during a
+ *      collection — single-threaded, no signal handlers.
+ *   2. Size the worklist from that snapshot.  It cannot overflow: a
+ *      block is pushed only when its mark bit was clear, and the bit is
+ *      set before the push, so each block enters at most once.
+ *   3. Scan the roots, marking and queueing whatever the globals point
+ *      at directly.
+ *   4. Drain.  This is what makes reachability transitive; without it
+ *      only the first block of a chain is ever marked.
+ *   5. Count, while the bits are still set.
+ *   6. Clear, so header and footer agree again before anyone can look at
+ *      the heap.  M3's sweep absorbs this pass.
+ *
+ * Nothing is freed.  That is M3.
+ */
 void gc_collect(void)
 {
-    /* Nothing to collect yet.  Marking arrives in M2, sweeping in M3. */
+    size_t n = gc_build_table();
+
+    /* 0 means no usable table — an empty heap, or a failed allocation.
+       Both mean the same thing here: do not proceed.  Checking it first
+       also keeps the malloc below from ever seeing a size of zero, which
+       may legitimately return NULL and would look like a failure that
+       never actually happened. */
+    if (n == 0)
+        return;
+
+    gc_worklist = malloc(n * sizeof(*gc_worklist));
+    if (gc_worklist == NULL)
+    {
+        gc_free_table(); /* release the snapshot we are abandoning */
+        return;
+    }
+    /* Reset explicitly rather than trusting the previous drain to have
+       finished: a collection that bailed out early leaves this dirty. */
+    gc_work_top = 0;
+
+    gc_mark_range(__data_start, _edata);
+    gc_mark_range(__bss_start, _end);
+    gc_drain();
+
+    gc_record_stats();
+    gc_clear_marks();
+
+    free(gc_worklist);
+    gc_worklist = NULL;
+    gc_work_top = 0;
+    gc_free_table();
 }

@@ -18,8 +18,21 @@
    they have run, and mem_heap_lo would hand back an uninitialised pointer. */
 void gc_init(void);
 
-/* gc_collect - run a collection.  Empty until M2. */
+/* gc_collect - run one marking pass.  Scans .data and .bss for roots,
+   marks everything reachable from them, records statistics, and clears
+   every mark before returning, so header and footer always agree by the
+   time a caller can look at the heap.  Frees nothing; that is M3. */
 void gc_collect(void);
+
+/* gc_report - print reachable vs. allocated blocks and payload bytes for
+   the most recent collection.  Reads figures captured during that
+   collection, so it stays meaningful after the marks have been cleared. */
+void gc_report(void);
+
+/* gc_stats - the same figures gc_report prints, for a caller that wants
+   to assert on them rather than read them.  Any pointer may be NULL. */
+void gc_stats(size_t *marked_blocks, size_t *marked_bytes,
+              size_t *total_blocks, size_t *total_bytes);
 
 /* gc_heap_lo - address of the first byte of the heap.
    Fixed for the life of the process. */
