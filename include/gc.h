@@ -71,4 +71,10 @@ void gc_table_dump(void);
    Implemented in step 3 of M1. */
 void *gc_isPtr(void *candidate);
 
+/* Note: there is deliberately no gc_sweep here.  Sweeping is the
+   destructive half of a collection and has a precondition — the heap must
+   have just been marked.  Called on its own, it would free every block in
+   the heap, because none of them would carry a mark.  gc_collect is the
+   only entry point; the sweep is internal to gc.c. */
+
 #endif

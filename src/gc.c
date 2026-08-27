@@ -10,6 +10,7 @@
 #include <stdint.h> /* uintptr_t, for aligning scan candidates */
 #include "memlib.h"
 #include "gc.h"
+#include "mm.h"
 
 /* ══════════════════════════════════════════════════════════════════
  *  Boundary-tag layout
@@ -361,17 +362,12 @@ static void gc_drain(void)
     }
 }
 
-/* gc_clear_marks - return every header to its unmarked state.
- *
- * The table is exactly the set of blocks that could have been marked, so
- * walking it is both complete and cheaper than walking the heap.  M3's
- * sweep absorbs this pass, since it must already visit every block. */
-static void gc_clear_marks(void)
-{
-    size_t i;
-    for (i = 0; i < gc_table_len; i++)
-        CLR_MARK(HDRP(gc_table[i].payload));
-}
+/* The separate clear pass that lived here through M2 is gone: gc_sweep
+   now does both of its jobs.  Survivors get an explicit CLR_MARK, and
+   freed blocks clear themselves, because mm_free writes
+   PACK(GET_SIZE(...), 0) and GET_SIZE masks off ~0x7.  M6's mark-only
+   mode will want something like it back. */
+
 /* ══════════════════════════════════════════════════════════════════
  *  Collection
  * ══════════════════════════════════════════════════════════════════ */
@@ -449,12 +445,16 @@ void gc_report(void)
     printf("gc: reachable   %zu/%zu blocks, %zu/%zu payload bytes\n",
            gc_marked_blocks, gc_total_blocks,
            gc_marked_bytes, gc_total_bytes);
-    printf("gc: unreachable %zu blocks, %zu payload bytes (nothing freed yet)\n",
+    printf("gc: reclaimed   %zu blocks, %zu payload bytes\n",
            gc_total_blocks - gc_marked_blocks,
            gc_total_bytes - gc_marked_bytes);
 }
 
-/* gc_collect - one full marking pass.
+/* Defined below gc_collect, so it needs a prototype here.  Kept static:
+   sweeping alone would free every block in the heap. */
+static void gc_sweep(void);
+
+/* gc_collect - one full mark and sweep.
  *
  * The phase order is forced, not chosen:
  *
@@ -468,11 +468,15 @@ void gc_report(void)
  *      at directly.
  *   4. Drain.  This is what makes reachability transitive; without it
  *      only the first block of a chain is ever marked.
- *   5. Count, while the bits are still set.
- *   6. Clear, so header and footer agree again before anyone can look at
- *      the heap.  M3's sweep absorbs this pass.
+ *   5. Count, while the bits are still set — the sweep destroys them.
+ *   6. Sweep: free every unmarked block, clear the mark on the rest.  By
+ *      the time this returns no header carries a mark, so header and
+ *      footer agree again and checkheap is meaningful.
  *
- * Nothing is freed.  That is M3.
+ * The root set is .data and .bss only.  A block reachable solely from a
+ * local variable WILL be reclaimed while it is still live.  That is not a
+ * bug in the sweep; it is the missing half of the root set, and it is
+ * what M4 and M5 exist to fix.
  */
 void gc_collect(void)
 {
@@ -501,10 +505,37 @@ void gc_collect(void)
     gc_drain();
 
     gc_record_stats();
-    gc_clear_marks();
+    gc_sweep();
 
     free(gc_worklist);
     gc_worklist = NULL;
     gc_work_top = 0;
     gc_free_table();
+}
+
+//
+static void gc_sweep(void)
+{
+    char *bp = gc_prologue();
+    for (bp = NEXT_BLKP(bp); GET_SIZE(HDRP(bp)) > 0;)
+    {
+        if (GET_ALLOC(HDRP(bp)))
+        {
+            if (!GET_MARK(HDRP(bp)))
+            {
+                char *temp = NEXT_BLKP(bp);
+                while (!GET_ALLOC(HDRP(temp)))
+                    temp = NEXT_BLKP(temp);
+                mm_free(bp);
+                bp = temp;
+            }
+            else
+            {
+                CLR_MARK(HDRP(bp));
+                bp = NEXT_BLKP(bp);
+            }
+        }
+        else
+            bp = NEXT_BLKP(bp);
+    }
 }

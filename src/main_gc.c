@@ -172,22 +172,24 @@ int main(void)
 
     gc_free_table();
 
-    section("M2 smoke test: collect with only .data/.bss as roots");
-    printf("7 blocks are allocated, and every pointer to them lives in\n");
-    printf("blocks[], which is a local in main.\n\n");
-    gc_collect();
-    gc_report();
-
-    section("allocator invariants after a collection");
-    checkheap(0);
-    printf("checkheap(0) reported nothing — marks were cleared\n");
-
     /* ═══════════════════════════════════════════════════════════════
-     *  M2 — a global pointer to a chain of 5, and 3 blocks with no
-     *  reference from any root region.
+     *  M2 / M3 — a global pointer to a chain of 5, and 3 blocks with no
+     *  reference from any root region.  M2 marked them; M3 reclaims the
+     *  three that nothing points at.
+     *
+     *  There was a smoke test here through M2 that ran gc_collect on the
+     *  M1 blocks — 7 live blocks that no root referenced — to show that
+     *  the collector cannot see the stack.  It was safe only while
+     *  nothing was freed.  With a sweep attached it reclaims all 7, and
+     *  the reset loop below then double-frees them, which is exactly how
+     *  it behaved before this section was removed: a segfault inside
+     *  coalesce, reading PREV_BLKP of a block that was already gone.
+     *
+     *  The demonstration belongs in M6's mark-only mode, which can report
+     *  what it would free without doing it.
      * ═══════════════════════════════════════════════════════════════ */
 
-    section("M2: reset the heap");
+    section("M3: reset the heap");
     /* Free every M1 block that is still allocated — 2, 5 and 8 already
        went in M1d, and freeing them again would be a double free.  The
        counts below only mean what they say on an otherwise empty heap. */
@@ -198,10 +200,11 @@ int main(void)
     gc_free_table();
     printf("heap holds no allocated blocks\n");
 
-    section("M2: build a 5-block chain plus 3 unreferenced blocks");
+    section("M3: build a 5-block chain plus 3 unreferenced blocks");
     {
         void *garbage[GARBAGE_LEN];
         void *prev = NULL;
+        size_t mblocks, mbytes, tblocks, tbytes;
 
         /* mm_calloc, not mm_malloc.  The collector is perfectly happy
            with garbage — a stale word that looks like a pointer just
@@ -228,26 +231,48 @@ int main(void)
         printf("chain head (global g_chain) : %p\n", g_chain);
         printf("garbage blocks (locals only): %p %p %p\n",
                garbage[0], garbage[1], garbage[2]);
-    }
 
-    section("M2: collect");
-    {
-        size_t mblocks, mbytes, tblocks, tbytes;
+        section("M3: collect — 5 reachable, 3 reclaimed");
 
         gc_collect();
         gc_report();
         gc_stats(&mblocks, &mbytes, &tblocks, &tbytes);
 
+        /* These figures describe the heap as it was BEFORE the sweep,
+           because gc_record_stats runs while the mark bits still exist.
+           So tblocks is still 8 even though only 5 blocks remain. */
         printf("\n");
         assert(tblocks == CHAIN_LEN + GARBAGE_LEN);
         assert(mblocks == CHAIN_LEN);
         assert(mbytes == CHAIN_LEN * NODE_BYTES);
-        assert(tblocks - mblocks == GARBAGE_LEN);
-        printf("  %zu allocated, %zu reachable, %zu unreachable — as expected\n",
-               tblocks, mblocks, tblocks - mblocks);
+        printf("  before the sweep: %zu allocated, %zu reachable\n",
+               tblocks, mblocks);
+
+        /* Rebuilding the table is the only way to see what survived it. */
+        assert(gc_build_table() == CHAIN_LEN);
+        printf("  after  the sweep:\n");
+        gc_table_dump();
+
+        section("M3: the reclaimed blocks are really gone");
+        /* garbage[] now holds dangling pointers.  gc_isPtr only compares
+           the values, it never dereferences them. */
+        for (i = 0; i < GARBAGE_LEN; i++)
+            expect("a reclaimed block's payload", gc_isPtr(garbage[i]), NULL);
+        expect("the chain head, still allocated", gc_isPtr(g_chain), g_chain);
+        gc_free_table();
+
+        section("M3: reclaimed space is reusable");
+        /* Distinguishes 'the blocks left the table' from 'the blocks were
+           genuinely handed back to the allocator'. */
+        {
+            void *reused = mm_calloc(1, NODE_BYTES);
+            assert(reused != NULL);
+            printf("allocated %p out of reclaimed space\n", reused);
+            mm_free(reused);
+        }
     }
 
-    section("M2: marking did not corrupt the chain");
+    section("M3: the sweep did not corrupt the chain");
     {
         void *p = g_chain;
         int links = 0;
@@ -260,7 +285,7 @@ int main(void)
         assert(links == CHAIN_LEN);
     }
 
-    section("M2: a cycle must terminate, not hang");
+    section("M3: a cycle must terminate, not hang");
     {
         size_t mblocks;
         void *tail = g_chain;
@@ -280,10 +305,15 @@ int main(void)
         *(void **)tail = NULL; /* undo, so checkheap sees a plain chain */
     }
 
-    section("allocator invariants after marking 5 blocks");
+    section("allocator invariants after a collection that freed");
     checkheap(0);
-    printf("checkheap(0) reported nothing — the clear pass really ran\n");
+    printf("checkheap(0) reported nothing — survivors had their marks\n");
+    printf("cleared, and the freed blocks coalesced cleanly\n");
 
-    printf("\n=== M2 COMPLETE — MARKING FROM GLOBALS WORKS ===\n");
+    printf("\n=== M3 COMPLETE — MARK AND SWEEP WORKS ===\n");
+    printf("\nCaveat: the root set is .data and .bss only.  A block reachable\n");
+    printf("solely from a local variable is reclaimed while still live.  This\n");
+    printf("test passes because it controls every reference it holds; real\n");
+    printf("code does not.  M4 adds the stack, M5 the registers.\n");
     return 0;
 }
