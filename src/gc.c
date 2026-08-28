@@ -73,10 +73,12 @@
  * reads it live instead.
  */
 static char *gc_heap_start; // first byte of heap needs +8 adjustment this points to the absolute starting of the heap
-
-void gc_init(void)
+static char *gc_stack_lo;
+static char *gc_stack_hi;
+void gc_init(void *addr)
 {
     gc_heap_start = (char *)mem_heap_lo();
+    gc_stack_hi = (char *)addr;
     gc_free_table();
 }
 
@@ -480,6 +482,8 @@ static void gc_sweep(void);
  */
 void gc_collect(void)
 {
+    int stack_lo;
+    gc_stack_lo = (char *)&stack_lo;
     size_t n = gc_build_table();
 
     /* 0 means no usable table — an empty heap, or a failed allocation.
@@ -502,6 +506,7 @@ void gc_collect(void)
 
     gc_mark_range(__data_start, _edata);
     gc_mark_range(__bss_start, _end);
+    gc_mark_range(gc_stack_lo, gc_stack_hi);
     gc_drain();
 
     gc_record_stats();
