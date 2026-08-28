@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h> /* uintptr_t, for aligning scan candidates */
+#include <setjmp.h> /* to spill callee-saved registers into memory */
 #include "memlib.h"
 #include "gc.h"
 #include "mm.h"
@@ -482,9 +483,36 @@ static void gc_sweep(void);
  */
 void gc_collect(void)
 {
+    /* regs - somewhere for the callee-saved registers to live.
+     *
+     * A heap pointer can be live in a register with no copy anywhere in
+     * memory, and no amount of stack scanning will find it.  setjmp exists
+     * to save enough machine state that longjmp can resume execution, and
+     * resuming means restoring the callee-saved registers — so setjmp has
+     * to write them somewhere we can read.  We never longjmp; the spill is
+     * the entire point.
+     *
+     * On i386 that is %ebx, %esi, %edi and %ebp — four registers, not the
+     * six of x86-64.  glibc stores those raw and mangles only the stack
+     * pointer and return address, so the words we care about are readable.
+     * The rest of the buffer is the saved signal mask; scanning it costs
+     * nothing.
+     *
+     * Together with the stack scan this closes the root set.  If some
+     * frame between the mutator and here wanted a callee-saved register,
+     * it had to spill the caller's value into its own frame first, and the
+     * stack scan covers that.  If nobody touched it, the value is still in
+     * the register and this buffer catches it.  Every register is in one
+     * case or the other.
+     */
+    jmp_buf regs;
     int stack_lo;
+    size_t n;
+
     gc_stack_lo = (char *)&stack_lo;
-    size_t n = gc_build_table();
+    setjmp(regs); /* for the spill, never resumed */
+
+    n = gc_build_table();
 
     /* 0 means no usable table — an empty heap, or a failed allocation.
        Both mean the same thing here: do not proceed.  Checking it first
@@ -507,6 +535,7 @@ void gc_collect(void)
     gc_mark_range(__data_start, _edata);
     gc_mark_range(__bss_start, _end);
     gc_mark_range(gc_stack_lo, gc_stack_hi);
+    gc_mark_range((char *)regs, (char *)regs + sizeof regs);
     gc_drain();
 
     gc_record_stats();
