@@ -17,11 +17,6 @@
 #define GARBAGE_LEN 3
 #define NODE_BYTES 16 /* a multiple of 8, so the payload has no padding */
 
-/* g_chain - the global root the chain hangs from.
- *
- * It lands in .bss, one of the regions gc_collect scans.  Through M3 this
- * was the ONLY way to keep a block alive, because the stack was not a root
- * region; from M4 on, locals count too. */
 /* clobber_stack - overwrite the stack region a returned frame occupied.
  *
  * Returning does not erase a frame; its words sit there until something
@@ -37,6 +32,11 @@ __attribute__((noinline)) static void clobber_stack(void)
         buf[k] = 0;
 }
 
+/* g_chain - the global root the chain hangs from.
+ *
+ * It lands in .bss, one of the regions gc_collect scans.  Through M3 this
+ * was the ONLY way to keep a block alive, because the stack was not a root
+ * region; from M4 on, locals count too. */
 static void *g_chain;
 
 static void section(const char *name)
@@ -81,8 +81,6 @@ static void expect(const char *what, void *got, void *want)
 static uintptr_t g_hidden[GARBAGE_LEN];
 static uintptr_t g_orphan;
 
-/* make_garbage - allocate blocks and let every reference to them die with
-   this frame.  Nothing in main ever holds one. */
 /* ── Why every helper below is noinline ────────────────────────────
  *
  * These functions exist to OWN A STACK FRAME THAT DIES.  Each one puts a
@@ -100,6 +98,8 @@ static uintptr_t g_orphan;
  * stopped existing.  noinline makes the call boundary load-bearing rather
  * than incidental.
  */
+/* make_garbage - allocate blocks and let every reference to them die with
+   this frame.  Nothing in main ever holds one. */
 __attribute__((noinline)) static void make_garbage(void)
 {
     size_t k;
@@ -460,11 +460,6 @@ __attribute__((noinline)) static void run_m3_tests(void)
 
         *(void **)tail = NULL; /* undo, so checkheap sees a plain chain */
     }
-
-    /* ═══════════════════════════════════════════════════════════════
-     *  M4 — the two done-when cases for stack roots.
-     * ═══════════════════════════════════════════════════════════════ */
-
 }
 
 int main(void)
@@ -537,10 +532,10 @@ int main(void)
     printf("checkheap(0) reported nothing — survivors had their marks\n");
     printf("cleared, and the freed blocks coalesced cleanly\n");
 
-    printf("\n=== M4 COMPLETE — GLOBALS, HEAP AND STACK ARE ROOTS ===\n");
-    printf("\nCaveat: CPU registers are still not roots.  A live heap pointer\n");
-    printf("held only in a callee-saved register, with no copy anywhere in\n");
-    printf("memory, is invisible to this collector and its block is freed.\n");
-    printf("M5 spills them with setjmp and scans the buffer.\n");
+    printf("\n=== ALL TESTS PASSED — M0 through M5 ===\n");
+    printf("\nThe root set is complete: .data and .bss via linker symbols, the\n");
+    printf("stack from gc_collect's frame up to main's, and the callee-saved\n");
+    printf("registers spilled into a jmp_buf by setjmp.\n");
+    printf("\nRun 'make run-bench-gc' for false-retention and cost figures.\n");
     return 0;
 }
