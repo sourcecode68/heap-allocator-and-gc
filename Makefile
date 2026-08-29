@@ -63,14 +63,22 @@ run-explicit: bin/test_explicit
 run-gc: bin/test_gc
 	./bin/test_gc
 
+# GC bench — a realistic-workload retention benchmark with its own main().
+bin/bench_gc: src/gc.c src/bench_gc.c lib/memlib.c src/mm_explicit.c
+	mkdir -p bin
+	$(CC) $(CFLAGS) $^ -o $@
+
+run-bench-gc: bin/bench_gc
+	./bin/bench_gc
+
 run-all: run-implicit run-explicit
 # works like a loop %.o matches all .o/.c files $< first dependency $@ first target
 
 run-bench: bin/bench_m bin/bench_glibc
 	./bin/bench_m >> bench_results.txt && ./bin/bench_glibc >> bench_results.txt
-.PHONY: clean all run-implicit run-explicit run-gc run-all run-bench# tells make that clean is just a command
+.PHONY: clean all run-implicit run-explicit run-gc run-bench-gc run-all run-bench# tells make that clean is just a command
 clean:
-	rm -f build/*.o bin/test_implicit bin/test_explicit bin/test_gc bin/program bin/bench_m bin/bench_glibc bench_results.txt
+	rm -f build/*.o bin/test_implicit bin/test_explicit bin/test_gc bin/bench_gc bin/program bin/bench_m bin/bench_glibc bench_results.txt
 
 
 #benchmarking

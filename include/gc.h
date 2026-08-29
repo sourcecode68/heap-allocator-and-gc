@@ -48,6 +48,25 @@ void gc_collect(void);
    collection, so it stays meaningful after the marks have been cleared. */
 void gc_report(void);
 
+/* ── Per-region attribution (M6) ──────────────────────────────────
+ *
+ * Where the accepted candidates came from.  A retention percentage on its
+ * own is a number; split by region it explains itself. */
+#define GC_R_DATA 0
+#define GC_R_BSS 1
+#define GC_R_STACK 2
+#define GC_R_REGS 3
+#define GC_R_PAYLOAD 4
+#define GC_NREGIONS 5
+
+/* gc_region_label - short name for a region index, for printing. */
+const char *gc_region_label(int region);
+
+/* gc_region_stats - words examined and words that passed the pointer test
+   in REGION during the most recent collection.  Either pointer may be
+   NULL; an out-of-range region writes nothing. */
+void gc_region_stats(int region, size_t *words_scanned, size_t *words_accepted);
+
 /* gc_stats - the same figures gc_report prints, for a caller that wants
    to assert on them rather than read them.  Any pointer may be NULL. */
 void gc_stats(size_t *marked_blocks, size_t *marked_bytes,

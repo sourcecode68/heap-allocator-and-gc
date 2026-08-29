@@ -8,7 +8,10 @@ build/
 # Executables
 test_implicit
 test_explicit
-bench_*
+# Binaries only — this used to be bare "bench_*", which also matched
+# src/bench_gc.c and src/bench_mark1_throughput.c and silently hid them
+# from git.  bin/ is ignored wholesale anyway.
+bin/bench_*
 
 # Editor files
 .vscode/

@@ -307,6 +307,38 @@ void *gc_isPtr(void *candidate)
 static struct gc_block **gc_worklist;
 static size_t gc_work_top;
 
+/* ── Per-region attribution ────────────────────────────────────────
+ *
+ * A retention figure on its own is a number; split by where the accepted
+ * candidates came from, it becomes an explanation.  These count every
+ * word the collector examines and every one that passes the pointer test,
+ * per root region.
+ *
+ * Purely additive — the marking logic is unchanged.  The counters are
+ * small integers in .bss, so the next collection scans them as roots and
+ * gc_lookup's bounds check rejects them, exactly like the statistics that
+ * were already there. */
+static size_t gc_scanned[GC_NREGIONS];
+static size_t gc_accepted[GC_NREGIONS];
+
+static const char *const gc_region_names[GC_NREGIONS] = {
+    ".data", ".bss", "stack", "registers", "payloads"};
+
+const char *gc_region_label(int region)
+{
+    return (region >= 0 && region < GC_NREGIONS) ? gc_region_names[region] : "?";
+}
+
+void gc_region_stats(int region, size_t *scanned, size_t *accepted)
+{
+    if (region < 0 || region >= GC_NREGIONS)
+        return;
+    if (scanned)
+        *scanned = gc_scanned[region];
+    if (accepted)
+        *accepted = gc_accepted[region];
+}
+
 /* gc_push - mark a block and queue its payload for scanning.
  *
  * Setting the bit BEFORE the push is what bounds the worklist, and it is
@@ -336,7 +368,7 @@ static void gc_push(struct gc_block *e)
  * unaligned address.  Note that 4 is the POINTER alignment, not the
  * 8-byte alignment of block payloads; conflating the two is how half the
  * roots get missed. */
-static void gc_mark_range(char *lo, char *hi)
+static void gc_mark_range(char *lo, char *hi, int region)
 {
     char *p = (char *)(((uintptr_t)lo + 3u) & ~(uintptr_t)3u); /* align up */
     // p is always an address never a value we get value by dereferencing
@@ -344,10 +376,12 @@ static void gc_mark_range(char *lo, char *hi)
     {
         // so now i have to read 4B value starting from the address p and treat is as an adddress to a character
         struct gc_block *e = gc_lookup((char *)GET(p));
+        gc_scanned[region]++;
         // struct gc_block*e=gc_lookup(*(char**)p); treat p as holding a pointer to a char * so dereffing gives me the 4 byte pointer to char * note that p still holds an address
 
         if (e != NULL)
         {
+            gc_accepted[region]++;
             gc_push(e);
         }
     }
@@ -361,7 +395,7 @@ static void gc_drain(void)
     while (gc_work_top > 0)
     {
         struct gc_block *e = gc_worklist[--gc_work_top];
-        gc_mark_range(e->payload, e->payload + e->psize);
+        gc_mark_range(e->payload, e->payload + e->psize, GC_R_PAYLOAD);
     }
 }
 
@@ -507,7 +541,7 @@ void gc_collect(void)
      */
     jmp_buf regs;
     int stack_lo;
-    size_t n;
+    size_t n, i;
 
     gc_stack_lo = (char *)&stack_lo;
     setjmp(regs); /* for the spill, never resumed */
@@ -532,10 +566,13 @@ void gc_collect(void)
        finished: a collection that bailed out early leaves this dirty. */
     gc_work_top = 0;
 
-    gc_mark_range(__data_start, _edata);
-    gc_mark_range(__bss_start, _end);
-    gc_mark_range(gc_stack_lo, gc_stack_hi);
-    gc_mark_range((char *)regs, (char *)regs + sizeof regs);
+    for (i = 0; i < GC_NREGIONS; i++)
+        gc_scanned[i] = gc_accepted[i] = 0;
+
+    gc_mark_range(__data_start, _edata, GC_R_DATA);
+    gc_mark_range(__bss_start, _end, GC_R_BSS);
+    gc_mark_range(gc_stack_lo, gc_stack_hi, GC_R_STACK);
+    gc_mark_range((char *)regs, (char *)regs + sizeof regs, GC_R_REGS);
     gc_drain();
 
     gc_record_stats();

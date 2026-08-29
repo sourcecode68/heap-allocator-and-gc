@@ -22,6 +22,21 @@
  * It lands in .bss, one of the regions gc_collect scans.  Through M3 this
  * was the ONLY way to keep a block alive, because the stack was not a root
  * region; from M4 on, locals count too. */
+/* clobber_stack - overwrite the stack region a returned frame occupied.
+ *
+ * Returning does not erase a frame; its words sit there until something
+ * reuses that memory.  Until then a dead local still holds a heap address
+ * that the collector will find and honour — a stale stack slot.  This is
+ * why M4's criterion says a block is reclaimed "eventually" rather than
+ * on the next collection.  volatile so the writes are not optimised away. */
+__attribute__((noinline)) static void clobber_stack(void)
+{
+    volatile char buf[768];
+    size_t k;
+    for (k = 0; k < sizeof buf; k++)
+        buf[k] = 0;
+}
+
 static void *g_chain;
 
 static void section(const char *name)
@@ -130,20 +145,6 @@ __attribute__((noinline)) static int orphan_alive(void)
     return r;
 }
 
-/* clobber_stack - overwrite the stack region a returned frame occupied.
- *
- * Returning does not erase a frame; its words sit there until something
- * reuses that memory.  Until then a dead local still holds a heap address
- * that the collector will find and honour — a stale stack slot.  This is
- * why M4's criterion says a block is reclaimed "eventually" rather than
- * on the next collection.  volatile so the writes are not optimised away. */
-__attribute__((noinline)) static void clobber_stack(void)
-{
-    volatile char buf[768];
-    size_t k;
-    for (k = 0; k < sizeof buf; k++)
-        buf[k] = 0;
-}
 
 /* run_m1_m3_setup - the M0/M1 tests, then free everything they allocated.
  *
