@@ -51,6 +51,12 @@ static size_t g_node_bytes = 16; /* requested size, varied by table 2 */
  * collector scans that as candidates like any other payload word. */
 static int g_use_malloc;
 
+/* g_fill_links - set only by dirty_heap: build_tree also copies each
+   node's LEFT/RIGHT into every later payload word.  Same pointees, so the
+   same reachability; the copies exist to survive mm_free, which
+   overwrites words 0 and 1 with PRED/SUCC. */
+static int g_fill_links;
+
 /* g_root - the live set, and the bench's only root.  In .bss, which
    gc_collect scans. */
 static void *g_root;
@@ -93,7 +99,31 @@ static void *build_tree(int depth, size_t *count)
         LEFT(n) = build_tree(depth - 1, count);
         RIGHT(n) = build_tree(depth - 1, count);
     }
+    if (g_fill_links)
+    {
+        size_t k;
+        for (k = 2; k < g_node_bytes / sizeof(void *); k++)
+            ((void **)n)[k] = ((void **)n)[k & 1];
+    }
     return n;
+}
+
+/* count_tree - add to *COUNT the nodes reachable from N through LEFT and
+   RIGHT, giving up once *COUNT passes LIMIT.  Recursive, mirroring
+   build_tree; an intact tree here is at most depth 14, so 15 frames.
+
+   The limit is for a broken tree.  If the links have been overwritten
+   they can form a cycle, and an unbounded walk then recurses until the
+   stack overflows — measured: 261,886 frames, then SIGSEGV.  Stopping one
+   past LIMIT bounds the depth to LIMIT + 1 and still guarantees a count
+   that does not match. */
+static void count_tree(void *n, size_t *count, size_t limit)
+{
+    if (n == NULL || *count > limit)
+        return;
+    (*count)++;
+    count_tree(LEFT(n), count, limit);
+    count_tree(RIGHT(n), count, limit);
 }
 
 /* drop_trees - build trees and let every reference to them die with this
@@ -142,9 +172,10 @@ __attribute__((noinline)) static void descend(int depth, size_t *garbage,
 
 /* reset_heap - drop the live set and reclaim it.
  *
- * One collection is enough, verified rather than assumed: after dropping
- * the root, a single pass leaves 0 blocks allocated at both -O0 and -O2,
- * and adding a second changes no figure in any table below.
+ * One collection is enough, verified rather than assumed: adding a second
+ * changes no figure in any table below, at -O0 or -O2, and every measured
+ * row allocates exactly the blocks its run builds, which it could not if
+ * a reset had left anything behind.
  *
  * It works because this runs at shallow stack depth.  The previous row's
  * deep descend() frames sit BELOW gc_stack_lo and are never scanned, and
@@ -152,9 +183,13 @@ __attribute__((noinline)) static void descend(int depth, size_t *garbage,
  * own call chain — gc_build_table, gc_mark_range, gc_lookup, then
  * gc_sweep into mm_free and coalesce.
  *
- * That is a property of this call shape, not a general law.  M4's orphan
- * test needed two passes because a tiny function left one pointer in a
- * slot gc_collect happened not to write. */
+ * That is a property of this call shape, not a general law.  Adding one
+ * local and a call to this function was enough to strand 2 blocks at one
+ * of its 113 calls at -O0 (the reset before table [4]).  M4's orphan
+ * test used to need two passes, and the slot responsible turned out to be
+ * inside gc_collect's own jmp_buf: _setjmp never writes its 32-word
+ * signal-mask area, so an earlier frame's copy of the orphan's address
+ * survived there and was scanned.  Zeroing the buffer fixed it. */
 __attribute__((noinline)) static void reset_heap(void)
 {
     g_root = NULL;
@@ -169,6 +204,75 @@ __attribute__((noinline)) static void plant_live(int depth)
     size_t c = 0;
     g_root = build_tree(depth, &c);
     g_live_nodes = c;
+}
+
+/* check_live - after a collection, confirm the live tree is all still there.
+ *
+ * Two jobs.  First, this read is what makes the tree live at -O2 at all.
+ * g_root is static, so nothing outside this file can name it, and before
+ * this function existed nothing inside it ever loaded it.  A store nobody
+ * loads changes no output, so GCC deleted g_root entirely: the collector
+ * found no root, freed all 127 nodes correctly, and the tables reported
+ * marked = 1 against live = 127.
+ *
+ * Second, it turns "live" from a label into a check.  mm_free writes PRED
+ * and SUCC into a block's first two payload words, which are LEFT and
+ * RIGHT here.  So had the collector freed a live node, this walk follows
+ * free-list links instead, and the count comes out wrong — verified by
+ * deleting the .bss scan, which makes the walk circle a PRED/SUCC pair
+ * until count_tree's limit stops it. */
+static void check_live(const char *where)
+{
+    size_t found = 0;
+
+    count_tree(g_root, &found, g_live_nodes);
+    if (found != g_live_nodes)
+    {
+        fprintf(stderr, "bench: %s: live tree has %s%zu nodes after collection, "
+                        "expected %zu -- the collector freed live data\n",
+                where, found > g_live_nodes ? "over " : "",
+                found > g_live_nodes ? g_live_nodes : found, g_live_nodes);
+        exit(1);
+    }
+}
+
+/* dirty_heap - give the next run a fixed, non-zero starting heap.
+ *
+ * mm_malloc hands back recycled memory as it finds it, and so does the
+ * padding mm_calloc leaves unzeroed.  What those stale words say depends
+ * on what lived there before, so a row run straight after another row
+ * inherits that row's leftovers.  Table [3] once ran each mm_malloc row
+ * straight after an mm_calloc row of the same size: same layout, same
+ * addresses, so the "stale" words were exactly what calloc had written
+ * and the two columns agreed by construction.  With a different row in
+ * between, mm_malloc at 64 bytes went from 9.9% to 13.8%.
+ *
+ * So every row of tables [2] and [3] starts from this same heap: old tree
+ * nodes at a stride no measured size shares, all freed.  A difference
+ * between rows is then the allocator's zeroing, not the order they ran.
+ *
+ * The nodes carry their links in EVERY payload word (g_fill_links), not
+ * just LEFT and RIGHT.  Freeing a block overwrites words 0 and 1 with
+ * PRED/SUCC, which is exactly where plain nodes keep their links.
+ * Measured with plain nodes: after the reset only 1,106 heap words held
+ * heap addresses, 19 distinct values, 878 copies of one free-list address.
+ * That heap has no old pointers to leak, so zeroing could not matter. */
+__attribute__((noinline)) static void dirty_heap(void)
+{
+    size_t saved_bytes = g_node_bytes, g = 0;
+    int saved_malloc = g_use_malloc;
+
+    reset_heap();
+    g_node_bytes = 40; /* 48-byte blocks */
+    g_use_malloc = 0;
+    g_fill_links = 1;
+    /* 35 trees x 31 nodes x 48 bytes = 52,080 bytes.  The largest row uses
+       460 blocks x 112 bytes = 51,520, so this covers all of it. */
+    drop_trees(4, 35, &g);
+    g_fill_links = 0;
+    reset_heap();
+    g_node_bytes = saved_bytes;
+    g_use_malloc = saved_malloc;
 }
 
 static void print_header(const char *what)
@@ -195,7 +299,9 @@ static double one_run(const char *label, int live_depth, int garbage_trees,
     descend(recursion, &garbage, &ms);
 
     gc_stats(&marked, &marked_bytes, &total, &total_bytes);
+    check_live(label);
     live = g_live_nodes;
+    /* check_live passed, so every live node was marked: marked >= live. */
     false_blocks = marked > live ? marked - live : 0;
     pct = garbage ? 100.0 * (double)false_blocks / (double)garbage : 0.0;
 
@@ -227,6 +333,7 @@ static double timed_run(int live_depth, int garbage_trees, int garbage_depth,
         drop_trees(garbage_depth, garbage_trees, &g);
         descend(recursion, &g, &ms);
         gc_stats(&marked, &mb, &total, &tb);
+        check_live(__func__);
 
         if (best < 0.0 || ms < best)
             best = ms;
@@ -250,7 +357,9 @@ static double quiet_run(int live_depth, int garbage_trees, int garbage_depth,
     descend(recursion, &garbage, &ms);
 
     gc_stats(&marked, &marked_bytes, &total, &total_bytes);
+    check_live(__func__);
     live = g_live_nodes;
+    /* check_live passed, so every live node was marked: marked >= live. */
     false_blocks = marked > live ? marked - live : 0;
     if (marked_out)
         *marked_out = marked;
@@ -345,9 +454,10 @@ int main(void)
     /* ---- 2. retention against allocation size ----
        mm_calloc zeroes the REQUESTED size, not the padded block size.  A
        request of 100 gets a 104-byte payload whose last 4 bytes still
-       hold whatever the block contained when it was free — which for this
-       allocator means PRED/SUCC, real heap addresses.  Sizes that are
-       already multiples of 8 have no padding and no such words. */
+       hold whatever that memory held before — an old node's link or a
+       free block's PRED/SUCC, real heap addresses either way.  Sizes that
+       are already multiples of 8 have no padding and no such words.
+       Every row starts from dirty_heap, so the leftovers are the same. */
     print_header("[2] requested node size  (recursion depth 32)"
                  "  — sizes not a multiple of 8 carry unzeroed padding");
     for (i = 0; i < sizeof sizes / sizeof sizes[0]; i++)
@@ -356,6 +466,7 @@ int main(void)
         size_t padded = (sizes[i] + 7u) & ~7u;
         g_node_bytes = sizes[i];
         snprintf(label, sizeof label, "%zu+%zu", sizes[i], padded - sizes[i]);
+        dirty_heap();
         one_run(label, 6, 20, 3, 32);
     }
     g_node_bytes = 16;
@@ -366,7 +477,8 @@ int main(void)
        including the PRED/SUCC free-list pointers the allocator wrote into
        the first two payload words while it sat on the free list.  The
        workload initialises the fields it uses either way, so what differs
-       is only the payload past them. */
+       is only the payload past them.  Both columns start from dirty_heap,
+       so that payload holds the same leftovers in each. */
     printf("\n  [3] mm_calloc vs mm_malloc  (recursion depth 32)\n");
     printf("      calloc zeroes the requested bytes; malloc zeroes nothing,\n");
     printf("      so stale words survive into the part the program never writes\n");
@@ -381,8 +493,10 @@ int main(void)
         g_node_bytes = sizes[i];
 
         g_use_malloc = 0;
+        dirty_heap();
         cp = quiet_run(6, 20, 3, 32, &cm, &cf);
         g_use_malloc = 1;
+        dirty_heap();
         mp = quiet_run(6, 20, 3, 32, &mm_, &mf);
         g_use_malloc = 0;
 
