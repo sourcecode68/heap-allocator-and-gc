@@ -163,7 +163,8 @@ root set, reachability, conservative collector, mark bit, sweep phase, boundary 
 allocated flag, implicit free list, explicit free list, coalescing, payload, CPU
 register, caller-saved, callee-saved, stack frame, stack growth direction, `.data`,
 `.bss`, linker symbol, `/proc/self/maps`, stale stack slot, floating garbage,
-interior pointer, worklist, spilling.
+interior pointer, worklist, spilling, mutator, ablation, A/B test,
+as-if rule, tail call, stack canary.
 
 **Not yet introduced — do not use until its milestone, and define it when you do:**
 tricolour marking, grey set, write barrier, read barrier, generational collection,

@@ -148,6 +148,12 @@ had to spill the caller's value into its own frame, and the stack scan
 finds it; if nobody touched it, the value is still in the register and
 the `jmp_buf` catches it.
 
+The `jmp_buf` is zeroed before `setjmp`. glibc's `<setjmp.h>` makes
+`setjmp` the `_setjmp` variant, which does not save the signal mask, so
+it writes only 7 of the buffer's 39 words. Unzeroed, the other 32 hold
+whatever an earlier frame left there and are scanned as roots —
+measured, they kept a dead block alive for an extra collection.
+
 ### Mark bit
 
 Bit 1 of the existing block header. It is free because every block size
@@ -282,9 +288,27 @@ Verified at 25/25 runs at both `-O0` and `-O2`, with and without ASLR,
 clean under `-Wall -Wextra -Wshadow -Wpointer-arith` and `-std=c11`.
 
 **Ablation** is used to confirm the code is load-bearing rather than
-merely present: deleting the stack scan alone passes (the register
-buffer covers it), deleting the register scan alone passes (the stack
-covers it), and deleting **both** fails at either optimisation level.
+merely present (10 runs each):
+
+| Deleted | `-O0` | `-O2` |
+|---|---|---|
+| stack scan | fails | passes |
+| register scan | passes | passes |
+| both | fails | fails |
+
+Every failure is the same check: the M4 block held only in a local is
+freed while live. At `-O0` that local lives in a stack slot and in no
+register, so only the stack scan finds it. At `-O2` it stays in a
+callee-saved register, and the `jmp_buf` catches it. Deleting the
+register scan alone passes for a different reason at each level: at
+`-O2`, `gc_collect`'s prologue pushes all four callee-saved registers
+into the scanned stack; at `-O0` it pushes only `%ebp` and `%ebx`, but
+the pointer is in a stack slot anyway.
+
+An earlier run reported that deleting the stack scan passed at `-O0`
+too. That pass came from the unzeroed `jmp_buf`: a stale copy of the
+address sat in its signal-mask area. Adding only the `memset` to that
+same build makes it fail 10/10.
 
 ---
 
@@ -297,38 +321,80 @@ conservative. So the workload is built with its live set known by
 construction: a full binary tree of depth *d* has exactly 2^(d+1)−1
 nodes and nothing else is reachable.
 
+After every measured collection the bench walks that tree and exits if
+a node is missing, so "live" is checked rather than assumed. An earlier
+version never read its root pointer; at `-O2` GCC deleted it as a dead
+store, and the collector — correctly — freed the whole "live" tree.
+
 ### Retention against stack depth
 
-| Recursion depth | Live | Garbage | Falsely retained | False retention |
-|---|---|---|---|---|
-| 0 | 127 | 301 | 4 | 1.3% |
-| 8 | 127 | 309 | 9 | 2.9% |
-| 32 | 127 | 333 | 33 | 9.9% |
-| 64 | 127 | 365 | 65 | 17.8% |
-| 128 | 127 | 429 | 129 | 30.1% |
+| Recursion depth | Live | Garbage | Falsely retained `-O0` | `-O0` | Falsely retained `-O2` | `-O2` |
+|---|---|---|---|---|---|---|
+| 0 | 127 | 301 | 1 | 0.3% | 1 | 0.3% |
+| 8 | 127 | 309 | 9 | 2.9% | 1 | 0.3% |
+| 32 | 127 | 333 | 33 | 9.9% | 1 | 0.3% |
+| 64 | 127 | 365 | 65 | 17.8% | 1 | 0.3% |
+| 128 | 127 | 429 | 129 | 30.1% | 1 | 0.2% |
 
-From depth 8 onward the retained count equals the number of recursion
-temporaries **exactly** — one per frame. The 300 tree-garbage blocks,
-built in a helper that returned, are always reclaimed. So retention is
-not diffuse: it is precisely the set of objects a live stack frame
-still mentions, whether or not the program will ever use them again.
+At `-O0` the retained count is *depth* + 1 at every depth — the number
+of recursion temporaries **exactly**, one per frame. The 300
+tree-garbage blocks, built in a helper that returned, are always
+reclaimed. So retention is not diffuse: it is precisely the set of
+objects a live stack frame still mentions, whether or not the program
+will ever use them again.
+
+At `-O2` there are no frames to mention them. The recursive call is the
+last thing the function does, so GCC compiles it as a jump back to the
+top — one frame however deep the "recursion" — and each temporary lives
+in `eax` until the next allocation overwrites it. The `-O2` column
+therefore does not vary stack depth at all.
 
 ### Retention against allocator zeroing
 
-| Node size | `mm_calloc` | `mm_malloc` |
-|---|---|---|
-| 16 | 9.9% | 9.9% |
-| 24 | 9.9% | 15.3% |
-| 64 | 9.9% | **17.4%** |
-| 100 | 15.9% | 15.9% |
-| 104 | 9.9% | 12.9% |
+| Node size | Padding | `mm_calloc` | `mm_malloc` |
+|---|---|---|---|
+| 16 | 0 | 9.9% | 41.1% |
+| 20 | 4 | 16.8% | 41.4% |
+| 24 | 0 | 9.9% | 41.4% |
+| 28 | 4 | 17.7% | 52.3% |
+| 64 | 0 | 9.9% | **100.0%** |
+| 100 | 4 | 9.9% | 56.8% |
+| 104 | 0 | 9.9% | 56.8% |
 
-`mm_malloc` zeroes nothing, so a recycled block arrives holding its
-predecessor's data — including the free-list pointers the allocator
-wrote into the first two payload words. At 16 bytes the program's own
-two writes land exactly on them and erase them; at 64 bytes fourteen
-words survive untouched. The 100-byte row shows the same leak through
-padding: `mm_calloc` zeroes the *request*, not the padded payload.
+Recursion depth 32, `-O0`; 9.9% is that depth's stack baseline of 33
+blocks. Every row starts from the same deliberately dirty heap: 1,085
+freed nodes, the 525 internal ones holding a child pointer in every
+payload word (the 560 leaves hold only NULLs).
+
+`mm_calloc` zeroes the requested bytes, so at multiples of 8 nothing
+stale survives and retention is exactly the baseline. `mm_malloc`
+zeroes nothing: the words the program never writes keep their old
+pointers, those land inside garbage blocks of the new layout, and at
+64 bytes all 333 garbage blocks are retained. Padding leaks the same
+way at 20 and 28 bytes, because `mm_calloc` zeroes the *request*, not
+the padded payload. At 100 it does not: 49 stale padding words pass the
+pointer test, but every one points at a block that is retained anyway. At
+`-O2` the pattern is the same without the stack baseline — `mm_calloc`
+0.3% (7.2% and 8.1% with padding), `mm_malloc` 31–92%.
+
+The history is pointer-dense on purpose, so these magnitudes show what
+unzeroed memory *can* do here, not what a typical program would see.
+Getting a fair table took three corrections:
+
+- **Freeing erases the obvious pointers.** `mm_free` overwrites a
+  block's first two words with `PRED`/`SUCC`, exactly where plain tree
+  nodes keep their links. A heap of freed plain nodes held only 19
+  distinct heap addresses across 52 KB, so zeroing had nothing to
+  prevent. The dirty nodes copy their links into every word.
+- **Rows inherit each other's leftovers.** Each `mm_malloc` row once ran
+  straight after an `mm_calloc` row of the same size: same layout, so
+  the "stale" words were exactly what `calloc` wrote, and the columns
+  agreed by construction.
+- **An earlier 9.9% → 17.4% gap came from neither allocator.** `setjmp`
+  (glibc's `_setjmp`) writes only 7 of the `jmp_buf`'s 39 words; the
+  collector scanned the other 32, which held stale stack data. Zeroing
+  the buffer first removed the gap, and deleting the `memset`
+  reproduced it exactly.
 
 ### Do arbitrary integers look like pointers?
 
@@ -351,10 +417,11 @@ objects, not by integers that coincidentally look like pointers.
 
 | Phase | Per block | Scales with |
 |---|---|---|
-| marking | 0.086 µs | the live set |
-| table build + sweep | 0.016 µs | the whole heap |
+| marking | 0.082 µs | the live set |
+| table build + sweep | 0.018 µs | the whole heap |
 
-33,079 blocks collected in 2.83 ms. Both phases linear. The ~5× gap is
+33,076 blocks collected in 2.73 ms, best of 3 at `-O0`; single readings
+spread by over 2×. Both phases linear. The ~4.6× gap is
 the pointer test: the sweep reads one header and tests a bit, while
 marking runs a binary search for every payload word.
 
@@ -367,9 +434,9 @@ allocator, which is exactly what this project did not have.
 
 Single-threaded. Not generational, incremental, or compacting. Heaps
 under 1 MB, so cache behaviour at larger scale is untested. Retention
-figures are compiler-dependent — `-O2` reuses stack slots and keeps
-more in registers, giving roughly half the retention of `-O0` at the
-same depth.
+figures are compiler-dependent: at `-O2` the stack-depth component
+disappears (1 block at every depth, against *depth* + 1 at `-O0`),
+while retention through unzeroed memory remains.
 
 ---
 
