@@ -7,10 +7,13 @@
 /*
  * Conservative mark & sweep garbage collector for the explicit allocator.
  *
- * M1 — the pointer test.  gc_build_table snapshots every allocated block
- * in the heap; gc_isPtr answers "does this value point into one, and if
- * so where does that block begin?"  Nothing is marked and nothing is
- * freed yet.
+ * gc_collect is the collector: it finds roots in .data, .bss, the stack
+ * and the spilled callee-saved registers, marks every allocated block they
+ * reach, and frees the rest.  Underneath it, gc_build_table snapshots the
+ * allocated blocks and gc_isPtr answers "does this value point into one,
+ * and if so where does that block begin?" — exposed so they can be tested
+ * on their own.  gc_report, gc_stats and the region figures describe the
+ * most recent collection.
  */
 
 /* gc_init - record the heap bounds and the bottom of the stack.
@@ -33,14 +36,16 @@ void gc_init(void *stack_bottom);
 
 /* gc_collect - run one full mark and sweep.
  *
- * Scans .data, .bss and the stack for roots, marks everything reachable
- * from them, frees every allocated block that was not reached, and clears
- * the mark on those that were.  No header carries a mark by the time this
- * returns, so header and footer agree again and checkheap is meaningful.
+ * Scans .data, .bss, the stack and the spilled callee-saved registers for
+ * roots, marks everything reachable from them, frees every allocated block
+ * that was not reached, and clears the mark on those that were.  No header
+ * carries a mark by the time this returns, so header and footer agree
+ * again and checkheap is meaningful.
  *
- * The root set does NOT include CPU registers.  A live heap pointer held
- * only in a callee-saved register with no copy in memory is invisible to
- * this, and its block will be freed.  That is M5's job. */
+ * Conservative in one direction only.  A block whose address is held
+ * anywhere it scans is never freed; but any word that merely looks like
+ * such an address — a stale stack slot, an old pointer in unzeroed memory,
+ * an integer that happens to match — keeps its block alive too. */
 void gc_collect(void);
 
 /* gc_report - print reachable vs. allocated blocks and payload bytes for

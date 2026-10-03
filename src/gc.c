@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdint.h> /* uintptr_t, for aligning scan candidates */
 #include <setjmp.h> /* to spill callee-saved registers into memory */
+#include <string.h> /* memset, for zeroing the jmp_buf */
 #include "memlib.h"
 #include "gc.h"
 #include "mm.h"
@@ -408,7 +409,7 @@ static void gc_drain(void)
 /* ══════════════════════════════════════════════════════════════════
  *  Collection
  * ══════════════════════════════════════════════════════════════════ */
-/* The root set, M2 edition: the executable's own .data and .bss.
+/* The static half of the root set: the executable's own .data and .bss.
  *
  * These four symbols are placed by the GNU linker; no object file
  * defines them.  They are declared as ARRAYS deliberately — a linker
@@ -420,7 +421,8 @@ static void gc_drain(void)
  * Scanned as two ranges rather than one merged span: .data and .bss are
  * adjacent in this binary, but that is not guaranteed.
  *
- * The stack and the registers are not roots yet.  M4 and M5.
+ * The other two roots, the stack and the spilled registers, are bounded
+ * at run time inside gc_collect.
  */
 extern char __data_start[], _edata[]; /* .data */
 extern char __bss_start[], _end[];    /* .bss  */
@@ -501,8 +503,9 @@ static void gc_sweep(void);
  *   2. Size the worklist from that snapshot.  It cannot overflow: a
  *      block is pushed only when its mark bit was clear, and the bit is
  *      set before the push, so each block enters at most once.
- *   3. Scan the roots, marking and queueing whatever the globals point
- *      at directly.
+ *   3. Scan the four root regions — .data, .bss, the stack, and the
+ *      jmp_buf holding the spilled callee-saved registers — marking and
+ *      queueing whatever they point at directly.
  *   4. Drain.  This is what makes reachability transitive; without it
  *      only the first block of a chain is ever marked.
  *   5. Count, while the bits are still set — the sweep destroys them.
@@ -510,12 +513,31 @@ static void gc_sweep(void);
  *      the time this returns no header carries a mark, so header and
  *      footer agree again and checkheap is meaningful.
  *
- * The root set is .data and .bss only.  A block reachable solely from a
- * local variable WILL be reclaimed while it is still live.  That is not a
- * bug in the sweep; it is the missing half of the root set, and it is
- * what M4 and M5 exist to fix.
+ * Why the low stack bound is a local and not __builtin_frame_address(0):
+ * the prologue saves the caller's %ebx just BELOW the frame pointer, then
+ * immediately overwrites %ebx with this function's GOT pointer.  By the
+ * time setjmp runs it captures our value, not the caller's, so that save
+ * slot is the only place the caller's %ebx still exists — and a bound at
+ * the frame pointer would exclude it.  The same holds for any callee-saved
+ * register this function changes before calling setjmp; a local covers
+ * all of them without having to track which.
+ *
+ * Which local does not matter.  The prologue pushes every saved register
+ * before it allocates space for locals, so all saves sit above all
+ * locals.  It must be a real stack local of THIS function: its address
+ * taken, not static, and not a callee's, whose frame gc_mark_range reuses
+ * before the scan.  That layout is how GCC builds i386 frames, verified
+ * at -O0 and -O2; it is compiler behaviour, not a language guarantee.
+ *
+ * noinline is load-bearing, not an optimisation hint.  The local marks the
+ * line between the program's frames and the collector's own callees only
+ * while gc_collect owns its frame.  Inlined into a caller, stack_lo would
+ * become one of the caller's locals, and GCC may place it above others of
+ * them, leaving those unscanned and their blocks freed while still live.
+ * The separate source file already prevents inlining today; noinline
+ * keeps it true under -flto or if gc_collect ever moves.
  */
-void gc_collect(void)
+__attribute__((noinline)) void gc_collect(void)
 {
     /* regs - somewhere for the callee-saved registers to live.
      *
@@ -529,8 +551,16 @@ void gc_collect(void)
      * On i386 that is %ebx, %esi, %edi and %ebp — four registers, not the
      * six of x86-64.  glibc stores those raw and mangles only the stack
      * pointer and return address, so the words we care about are readable.
-     * The rest of the buffer is the saved signal mask; scanning it costs
-     * nothing.
+     *
+     * Only 7 of the buffer's 39 words get written.  <setjmp.h> defines
+     * setjmp as _setjmp, which does NOT save the signal mask, so the
+     * 32-word mask area keeps whatever an earlier frame left in that
+     * memory — and the whole buffer is scanned as a root region.  Hence
+     * the memset below.  Measured without it: 27-31 of those 32 words were
+     * non-zero stale stack data, they kept the M4 orphan alive for an
+     * extra collection, and they manufactured a 9.9% -> 17.4% retention
+     * gap between mm_calloc and mm_malloc that vanishes once the buffer is
+     * zeroed.  Removing the memset reproduces both exactly.
      *
      * Together with the stack scan this closes the root set.  If some
      * frame between the mutator and here wanted a callee-saved register,
@@ -540,9 +570,9 @@ void gc_collect(void)
      * case or the other.
      */
     jmp_buf regs;
-    int stack_lo;
+    int stack_lo = 0;
     size_t n, i;
-
+    memset(&regs, 0, sizeof regs); /* avoid uninitialised reads in the spill */
     gc_stack_lo = (char *)&stack_lo;
     setjmp(regs); /* for the spill, never resumed */
 

@@ -502,11 +502,19 @@ int main(void)
 
         gc_collect();
 
-        /* The frame is gone but its bytes are not.  A dead local still
-           holding the address is a stale stack slot, and the collector
-           cannot tell it from a live one, so the block may well survive
-           this first collection.  That is why the criterion says
-           "eventually" rather than "on the next collection". */
+        /* The frame is gone but its bytes are not.  A stale copy of the
+           address left anywhere the collector scans keeps the block alive,
+           and the collector cannot tell it from a live reference — which is
+           why the criterion says "eventually" rather than "on the next
+           collection", and why this retries instead of asserting.
+
+           In this build it used to need the retry every time.  The stale
+           copy lay in leftover bytes from earlier calls that gc_collect's
+           own jmp_buf now sits on top of — the 32-word signal-mask area
+           _setjmp never writes — so they were scanned as if they were
+           saved registers.  With that buffer zeroed the orphan dies on
+           collection 1 at both -O0 and -O2; the retry stays because the
+           mechanism is general. */
         if (orphan_alive())
         {
             printf("still alive after collection 1 -- a stale stack slot\n");
@@ -517,8 +525,8 @@ int main(void)
         }
         else
         {
-            printf("already reclaimed on collection 1 -- the slot had been\n");
-            printf("reused before the collector looked\n");
+            printf("already reclaimed on collection 1 -- no stale copy of\n");
+            printf("its address survived anywhere the collector scans\n");
         }
 
         printf("  still reachable? %s   (after %d collection%s)\n",
